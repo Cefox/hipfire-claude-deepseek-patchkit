@@ -34,7 +34,18 @@ cd "$HOME/.hipfire/src"
 cargo build --release --locked -p hipfire-cli -p hipfire-daemon
 ```
 
-Then install/restart them through your normal HipFire setup procedure. The patch script intentionally does not overwrite binaries or restart a running service. To remove the patch before applying another version, stop HipFire and run:
+The patch script intentionally does not overwrite binaries or restart a running service. For the standard managed installation, back up and replace both binaries after the build:
+
+```bash
+backup="$HOME/.hipfire/backups/hipfire-patch-$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 700 "$backup"
+cp -p "$HOME/.hipfire/bin/hipfire" "$backup/hipfire"
+cp -p "$HOME/.hipfire/bin/daemon" "$backup/daemon"
+install -m 755 "$HOME/.hipfire/src/target/release/hipfire" "$HOME/.hipfire/bin/hipfire"
+install -m 755 "$HOME/.hipfire/src/target/release/daemon" "$HOME/.hipfire/bin/daemon"
+```
+
+Start HipFire again using your normal service command. The backup directory contains the previous binaries for rollback. To remove the patch before applying another version, stop HipFire and run:
 
 ```bash
 ./scripts/revert.sh "$HOME/.hipfire/src"
