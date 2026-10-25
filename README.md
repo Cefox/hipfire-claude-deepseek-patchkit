@@ -9,7 +9,7 @@ The patch includes the previously requested Claude Code compatibility work and D
 - Raises the total tool documentation budget to 4 MiB while retaining separate tool/name/schema limits.
 - Executes Claude’s native `web_search` server tool through DeepSeek’s Search API, maps results to Anthropic server-tool response blocks, and feeds summaries back into local generation.
 - Preserves the mixed server/client tool sequence: a search is deferred when Claude Code also needs to run a local tool, then executed after the client returns its result.
-- Keeps the tool call authenticated with HipFire’s bearer token and reads the DeepSeek credential only from the HipFire process environment. Search result text is explicitly marked as untrusted input to reduce prompt-injection risk.
+- Uses the DeepSeek key carried by each Claude Code request; a server-side DeepSeek key remains an optional fallback and requires HipFire bearer authentication. Search result text is explicitly marked as untrusted input to reduce prompt-injection risk.
 
 ## Apply after a HipFire upgrade
 
@@ -57,7 +57,7 @@ The patched HipFire server accepts the DeepSeek key either in a Claude Code requ
 
 ### Configure both keys through CC Switch
 
-In the Claude Code provider editor, set the protocol to Anthropic Messages, the base URL to `http://127.0.0.1:11435`, and enter the HipFire bearer token in the provider's **API Key** field. CC Switch maps that provider credential to Claude Code's `ANTHROPIC_AUTH_TOKEN`; it must match the token configured by HipFire's `serve.api_key_file`.
+In the Claude Code provider editor, set the protocol to Anthropic Messages and the base URL to `http://127.0.0.1:11435`. If you have configured HipFire bearer authentication, enter its matching token in the provider's **API Key** field. CC Switch maps that value to Claude Code's `ANTHROPIC_AUTH_TOKEN`.
 
 Then add the DeepSeek Search key in the Claude Code config JSON editor at the bottom of the provider editor. Preserve the existing JSON and add this property inside its `env` object:
 
@@ -82,7 +82,7 @@ printf '\n'
 export HIPFIRE_DEEPSEEK_API_KEY
 ```
 
-For systemd, store it in a permission-restricted environment file and reference that file from the HipFire service unit; do not put the key in this patch kit or a shell command line. HipFire requires `serve.api_key_file` to be configured before enabling web search, and the matching bearer token belongs in CC Switch. Search and Fetch are listed at $0.75 per 1,000 successful direct API requests in [DeepSeek’s Search & Fetch billing docs](https://api-docs.deepseek.com/guides/search/#billing); this patch calls the Search endpoint directly.
+For systemd, store it in a permission-restricted environment file and reference that file from the HipFire service unit; do not put the key in this patch kit or a shell command line. With the CC Switch request-header method above, HipFire does not need a server-side DeepSeek key or a `serve.api_key_file` just to perform search: each request carries the caller's DeepSeek credential. If you instead configure the DeepSeek key in HipFire's process environment, enable HipFire bearer authentication so LAN clients cannot spend that server-held key. Independently, bearer authentication is recommended when exposing the inference API to a LAN. Search and Fetch are listed at $0.75 per 1,000 successful direct API requests in [DeepSeek’s Search & Fetch billing docs](https://api-docs.deepseek.com/guides/search/#billing); this patch calls the Search endpoint directly.
 
 The adapter supports the basic `web_search_20250305` tool and direct-call use of the 20260209/20260318 variants. It refuses dynamic-filtering requests that require code execution, and it does not implement Claude’s separate `web_fetch` tool. Anthropic’s protocol requires a `server_tool_use` / `web_search_tool_result` pair; when mixed with client tools, the result is deferred until the client tool result arrives ([server tool protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/server-tools), [web search protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool)). DeepSeek’s API accepts `query`, `count`, `need_content`, domain operators, and returns ranked results with summary, snippet, URL, and date ([Search API](https://api-docs.deepseek.com/guides/search/)).
 
@@ -95,7 +95,7 @@ export HIPFIRE_MODEL=/absolute/path/to/qwen3.8-flash-next.mq4-xts
 ./scripts/start-serve-1m.sh
 ```
 
-The service binds to `0.0.0.0:11435` by default; set `BIND_ADDRESS=127.0.0.1` for localhost only. The profile uses YaRN factor 4, Q8 KV, MTP, and the existing GPU/NPU trunk route. A configured `serve.api_key_file` is required before exposing paid search to LAN clients.
+The service binds to `0.0.0.0:11435` by default; set `BIND_ADDRESS=127.0.0.1` for localhost only. The profile uses YaRN factor 4, Q8 KV, MTP, and the existing GPU/NPU trunk route. With the CC Switch request-header key, no extra HipFire bearer-key setup is required for search; bearer authentication remains recommended for general LAN API access.
 
 CC Switch provider settings for Claude Code:
 
@@ -103,14 +103,14 @@ CC Switch provider settings for Claude Code:
 |---|---|
 | API compatibility | Anthropic Messages API |
 | Base URL (same host) | `http://127.0.0.1:11435` |
-| Base URL (other LAN device) | `http://192.168.0.144:11435` |
-| API key | The bearer token configured by HipFire’s `serve.api_key_file` |
+| Base URL (other LAN device) | Use a TLS-protected endpoint; plain HTTP exposes the custom DeepSeek header |
+| API key | If HipFire bearer authentication is configured, use the matching token; the request-header search mode needs no extra server token |
 | Model and model aliases | The exact model ID/path accepted by the HipFire server |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `1048576` |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | `786432` |
 | Thinking | Keep enabled; do not set a thinking-disable variable |
 
-These values are guidance for CC Switch; this package does not edit the client’s personal provider settings. Verify that the client’s API key matches the server token and that TCP port 11435 is reachable from the intended LAN.
+These values are guidance for CC Switch; this package does not edit the client’s personal provider settings. Verify that TCP port 11435 is reachable from the intended host. When bearer authentication is enabled, the provider API key must match the server token.
 
 ## Verification performed
 
@@ -118,7 +118,7 @@ The patch was tested in a temporary worktree based on the commit above:
 
 - Anthropic adapter tests: 18 passed, including a mixed native-search/client-tool round trip.
 - DeepSeek web-search tests: passed, including key precedence, a local mock Search API request, result-to-Anthropic mapping, and continuation decoding.
-- HipFire CLI tests: 876 passed, 0 failed, 1 ignored. HipFire daemon tests: 62 passed, 0 failed.
+- HipFire CLI tests: 877 passed, 0 failed, 1 ignored. HipFire daemon tests: 62 passed, 0 failed.
 - Pending search/server result ordering test: passed without a network call.
 - Qwen4 inline-system adapter tests in generate and loader crates: passed.
 - Earlier checks on the same patch set also passed the tool-budget regression and `cargo check` for `hipfire-cli` and `hipfire-generate`.
