@@ -1,0 +1,209 @@
+diff --git a/crates/hipfire-cli/src/serve/anthropic.rs b/crates/hipfire-cli/src/serve/anthropic.rs
+--- a/crates/hipfire-cli/src/serve/anthropic.rs
++++ b/crates/hipfire-cli/src/serve/anthropic.rs
+@@ -18,6 +18,7 @@
+ use crate::serve::http::{id_suffix, sse_event};
+ use hipfire_runtime::prompt_frame::ToolCall;
+ use serde_json::{json, Map, Value};
++use std::collections::BTreeSet;
+ 
+ /// A Messages request lowered onto the chat-completions body.
+ #[derive(Debug)]
+@@ -106,7 +107,7 @@
+     }
+     let mut has_native_web_search = false;
+     if let Some(tools) = present(obj, "tools") {
+-        let tools = lower_tools(tools)?;
++        let tools = lower_tools(tools, input)?;
+         has_native_web_search = tools.iter().any(|tool| {
+             tool.pointer("/function/name").and_then(Value::as_str)
+                 == Some(crate::serve::web_search::INTERNAL_TOOL_NAME)
+@@ -118,6 +119,8 @@
+             let config = web_search_config(present(obj, "tools").expect("tools present"))?;
+             chat.insert("_hipfire_web_search_config".into(), config);
+         }
++    } else if !referenced_tools(input)?.is_empty() {
++        return Err("tool_reference requires a corresponding definition in tools".into());
+     }
+     if let Some(choice) = present(obj, "tool_choice") {
+         let mut lowered = lower_tool_choice(choice)?;
+@@ -310,6 +313,12 @@
+                 let part_path = format!("{path}.content.{k}");
+                 match block_type(part, &part_path)? {
+                     "text" => text.push_str(block_text(part, &part_path)?),
++                    "tool_reference" => {
++                        let name = tool_reference_name(part, &part_path)?;
++                        text.push_str(&format!(
++                            "\nTool available: {name}. Use its declared input schema.\n"
++                        ));
++                    }
+                     other => {
+                         return Err(format!(
+                             "{part_path}: `{other}` blocks inside tool_result are not supported"
+@@ -431,10 +440,68 @@
+ /// Client tools (`name`, `description`, `input_schema`) → chat function
+ /// tools. Claude's native web-search tool is mapped to a HipFire server
+ /// function and executed by the DeepSeek Search API in the request loop.
+-fn lower_tools(tools: &Value) -> Result<Vec<Value>, String> {
++fn tool_reference_name<'a>(part: &'a Value, path: &str) -> Result<&'a str, String> {
++    part.get("tool_name")
++        .and_then(Value::as_str)
++        .filter(|name| !name.is_empty())
++        .ok_or_else(|| format!("{path}.tool_name: field required (non-empty string)"))
++}
++
++/// Client ToolSearch returns references, not full schemas. Keep unselected
++/// deferred definitions out of both counting and generation; otherwise a
++/// discovery round trip can silently expand hundreds of MCP tools.
++fn referenced_tools(messages: &[Value]) -> Result<BTreeSet<String>, String> {
++    let mut names = BTreeSet::new();
++    for (at, message) in messages.iter().enumerate() {
++        if message.get("role").and_then(Value::as_str) != Some("user") {
++            continue;
++        }
++        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
++            continue;
++        };
++        for (j, block) in blocks.iter().enumerate() {
++            if block.get("type").and_then(Value::as_str) != Some("tool_result")
++                || block.get("is_error").and_then(Value::as_bool) == Some(true)
++            {
++                continue;
++            }
++            let Some(parts) = block.get("content").and_then(Value::as_array) else {
++                continue;
++            };
++            for (k, part) in parts.iter().enumerate() {
++                if part.get("type").and_then(Value::as_str) == Some("tool_reference") {
++                    let path = format!("messages.{at}.content.{j}.content.{k}");
++                    names.insert(tool_reference_name(part, &path)?.to_owned());
++                }
++            }
++        }
++    }
++    Ok(names)
++}
++
++fn lower_tools(tools: &Value, messages: &[Value]) -> Result<Vec<Value>, String> {
+     let tools = tools
+         .as_array()
+         .ok_or_else(|| "tools must be an array".to_owned())?;
++    let referenced = referenced_tools(messages)?;
++    for name in &referenced {
++        if !tools
++            .iter()
++            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
++        {
++            return Err(format!(
++                "tool_reference `{name}` has no corresponding definition in tools"
++            ));
++        }
++    }
++    for (k, tool) in tools.iter().enumerate() {
++        if tool
++            .get("defer_loading")
++            .is_some_and(|value| !value.is_boolean())
++        {
++            return Err(format!("tools.{k}.defer_loading must be a boolean"));
++        }
++    }
+     let native_search_count = tools
+         .iter()
+         .filter(|tool| {
+@@ -450,6 +517,11 @@
+     tools
+         .iter()
+         .enumerate()
++        .filter(|(_, tool)| {
++            tool.get("defer_loading").and_then(Value::as_bool) != Some(true)
++                || tool.get("name").and_then(Value::as_str)
++                    .is_some_and(|name| referenced.contains(name))
++        })
+         .map(|(k, tool)| {
+             if let Some(kind) = tool.get("type").and_then(Value::as_str) {
+                 if matches!(kind, "web_search_20250305" | "web_search_20260209" | "web_search_20260318") {
+@@ -1029,6 +1101,84 @@
+     }
+ 
+     #[test]
++    fn deferred_tool_reference_round_trip_keeps_count_and_generate_identical() {
++        let body = json!({
++            "model":"m", "max_tokens":1,
++            "tools":[
++                {"name":"ToolSearch", "input_schema":{"type":"object"}},
++                {"name":"WebSearch", "defer_loading":true,
++                 "description":"Search the web", "input_schema":{"type":"object"}},
++                {"name":"UnusedMcpTool", "defer_loading":true,
++                 "description":"unused documentation".repeat(10000),
++                 "input_schema":{"type":"object"}}
++            ],
++            "messages":[
++                {"role":"user", "content":"hi"},
++                {"role":"assistant", "content":[{"type":"tool_use", "id":"search1",
++                    "name":"ToolSearch", "input":{"query":"select:WebSearch"}}]},
++                {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"search1",
++                    "content":[{"type":"tool_reference", "tool_name":"WebSearch"}]},
++                    {"type":"text", "text":"Tool loaded."}]}
++            ]
++        });
++        let generated = lower_request(&body).unwrap().chat;
++        assert_eq!(lower_count_request(&body).unwrap(), generated);
++        let tools = generated["tools"].as_array().unwrap();
++        assert_eq!(tools.len(), 2);
++        assert_eq!(tools[1]["function"]["name"], "WebSearch");
++        assert!(generated["messages"][2]["content"]
++            .as_str()
++            .unwrap()
++            .contains("WebSearch"));
++        assert!(!generated.to_string().contains("unused documentation"));
++    }
++
++    #[test]
++    fn unreferenced_deferred_tools_do_not_inflate_the_prompt() {
++        let mut tools = vec![json!({"name":"ToolSearch", "input_schema":{"type":"object"}})];
++        for i in 0..232 {
++            tools.push(json!({"name":format!("mcp_tool_{i}"), "defer_loading":true,
++                "description":"large tool documentation".repeat(200),
++                "input_schema":{"type":"object"}}));
++        }
++        let body = json!({"model":"m", "max_tokens":1, "tools":tools,
++            "messages":[{"role":"user", "content":"hi"}]});
++        let generated = lower_request(&body).unwrap().chat;
++        assert_eq!(lower_count_request(&body).unwrap(), generated);
++        assert_eq!(generated["tools"].as_array().unwrap().len(), 1);
++        assert!(generated.to_string().len() < 1000);
++    }
++
++    #[test]
++    fn tool_references_require_declared_tools_and_nonempty_names() {
++        let mut body = json!({"model":"m", "max_tokens":1,
++            "tools":[{"name":"Read", "input_schema":{"type":"object"}}],
++            "messages":[{"role":"user", "content":[{"type":"tool_result",
++                "tool_use_id":"search1", "content":[{"type":"tool_reference", "tool_name":"Missing"}]}]}]});
++        assert!(lower_request(&body)
++            .unwrap_err()
++            .contains("no corresponding definition"));
++        body.as_object_mut().unwrap().remove("tools");
++        assert!(lower_count_request(&body)
++            .unwrap_err()
++            .contains("corresponding definition"));
++        body["messages"][0]["content"][0]["content"][0]["tool_name"] = json!("");
++        assert!(lower_request(&body)
++            .unwrap_err()
++            .contains("non-empty string"));
++    }
++
++    #[test]
++    fn failed_tool_search_does_not_activate_deferred_schema() {
++        let body = json!({"model":"m", "max_tokens":1,
++            "tools":[{"name":"Read", "defer_loading":true, "input_schema":{"type":"object"}}],
++            "messages":[{"role":"user", "content":[{"type":"tool_result",
++                "tool_use_id":"search1", "is_error":true,
++                "content":[{"type":"tool_reference", "tool_name":"Read"}]}]}]});
++        assert!(lower_request(&body).unwrap().chat.get("tools").is_none());
++    }
++
++    #[test]
+     fn lowers_system_multi_turn_sampling_and_stops() {
+         let lowered = lower_request(&json!({
+             "model": "qwen3.5:4b",

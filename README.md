@@ -6,6 +6,7 @@ The patch includes the previously requested Claude Code compatibility work and D
 
 - Correctly lowers inline `system` messages and recognizes Claude Code’s `count_tokens` request path.
 - Counts prompts through the resident Qwen4 template/tokenizer path and keeps counting side-effect free.
+- Supports client-side ToolSearch `tool_reference` results and `defer_loading`: only referenced deferred schemas enter the rendered prompt, using the same projection for counting and generation.
 - Raises the total tool documentation budget to 4 MiB while retaining separate tool/name/schema limits.
 - Executes Claude’s native `web_search` server tool through DeepSeek’s Search API, maps results to Anthropic server-tool response blocks, and feeds summaries back into local generation.
 - Preserves the mixed server/client tool sequence: a search is deferred when Claude Code also needs to run a local tool, then executed after the client returns its result.
@@ -25,7 +26,7 @@ If you specifically want to patch your older standalone clone instead, pass its 
 ./scripts/apply.sh /path/to/your/hipfire-clone
 ```
 
-The script refuses a dirty source tree, detects an already-applied patch, and uses `git apply --check` before changing files. If the patch no longer applies cleanly after a later upstream change, stop and rebase/review it; do not force-apply it.
+The script applies the original compatibility patch followed by the deferred-tool patch. It also upgrades a source tree that already has the original patch, detects an already-completed upgrade, and refuses unrelated dirty source trees. Each patch is checked before application; if a fresh installation cannot apply the second patch, the first patch is rolled back. If the patch no longer applies cleanly after a later upstream change, stop and rebase/review it; do not force-apply it.
 
 Build the changed binaries from that source tree:
 
@@ -86,7 +87,40 @@ For systemd, store it in a permission-restricted environment file and reference 
 
 The adapter supports the basic `web_search_20250305` tool and direct-call use of the 20260209/20260318 variants. It refuses dynamic-filtering requests that require code execution, and it does not implement Claude’s separate `web_fetch` tool. Anthropic’s protocol requires a `server_tool_use` / `web_search_tool_result` pair; when mixed with client tools, the result is deferred until the client tool result arrives ([server tool protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/server-tools), [web search protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool)). DeepSeek’s API accepts `query`, `count`, `need_content`, domain operators, and returns ranked results with summary, snippet, URL, and date ([Search API](https://api-docs.deepseek.com/guides/search/)).
 
-## 1M-context launch and CC Switch values
+## Claude Code ToolSearch / context-overflow fix (2026-10-25)
+
+The observed 256K failure was caused by protocol compatibility, not by an inaccurate Qwen tokenizer. A fresh Claude Code 2.1.310 conversation sent `hi` with about 14.6K rendered input tokens. When its client-side ToolSearch returned a `tool_reference`, the old adapter rejected that block. Claude Code then disabled tool search and resent 232 complete tool definitions (about 909K JSON characters), producing about 274K input tokens before the 32K output allowance.
+
+`patches/hipfire-claude-deferred-tools.patch` fixes that round trip. It accepts `tool_reference` blocks inside user `tool_result` content, validates their names against the request's tool definitions, and activates only referenced deferred tools. Unselected `defer_loading: true` definitions stay out of the prompt. The count and generation endpoints use this same transformation. Explicitly non-deferred definitions remain available; genuinely oversized prompts are still refused rather than silently truncated.
+
+This implements client-side ToolSearch results. It does not implement Anthropic's server-side regex/BM25 search tools. Selected schemas are exposed through Qwen's normal function-tool section, so activating a tool can change the prompt prefix; exact Anthropic inline-expansion/cache behavior is not claimed. See [Anthropic's tool-search protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool).
+
+For the current native 256K service, configure CC Switch as follows (do not append `[1m]` to the model):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:11435",
+    "ANTHROPIC_MODEL": "qwen3.8:flash-next",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "196608",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+    "CLAUDE_CODE_EFFORT_LEVEL": "xhigh"
+  }
+}
+```
+
+Merge these entries into the existing configuration and preserve authentication/custom headers. Configure all model aliases and subagent overrides for the same accepted model ID. The package does not edit personal Claude Code settings. Restart Claude Code after rebuilding/restarting HipFire. Prefer a new CC conversation for verification: a conversation that already switched to eager loading can continue to resend the enlarged tool registry.
+
+Run the local regression against a running patched service without external search calls:
+
+```bash
+python3 scripts/verify-deferred-tools.py --url http://127.0.0.1:11435 --model qwen3.8:flash-next
+```
+
+The script checks that 232 dormant tool definitions do not inflate the prompt, a referenced tool is activated, both a normal and a ToolSearch follow-up request succeed, and `/count_tokens` matches total input usage (including cached input). It generates only short responses and never executes a returned client tool.
+
+## Optional historical 1M-context launch and CC Switch values
 
 For the previously selected Qwen3.8 Flash-Next 1M profile, set `HIPFIRE_MODEL` to the absolute installed model path and run:
 
@@ -112,11 +146,28 @@ CC Switch provider settings for Claude Code:
 
 These values are guidance for CC Switch; this package does not edit the client’s personal provider settings. Verify that TCP port 11435 is reachable from the intended host. When bearer authentication is enabled, the provider API key must match the server token.
 
+## Deferred-tool verification results
+
+On the native 262144-token Qwen3.8 Flash-Next service with forced NPU enabled:
+
+| Check | Count endpoint | Generation input usage |
+|---|---:|---:|
+| Baseline request, only ToolSearch | 278 | — |
+| Same request plus 232 dormant schemas (1,172,342 bytes of tool JSON) | 278 | 278 |
+| Follow-up activating one deferred schema | 1,201 | 1,201 |
+| Replay using the local CC tool registry and its WebSearch reference | 14,875 | 14,875 |
+
+The eager fallback registry from that CC session still counts as 273,472 tokens in the replay control, exceeding native 256K. The fix preserves lazy discovery so that fallback is not necessary; it does not falsify counts or silently discard explicitly active tools. Exact failing-session counts differ because its message history changed between retries. The real-request replay used a short, explicit 16-token generation cap; its `max_tokens` stop reason is expected for that bounded diagnostic.
+
+An end-to-end Claude Code 2.1.310 run also passed: it called only ToolSearch, received one `tool_reference`, and returned `OK` in two turns with zero API errors. Its two request shapes contained 12 and 13 tool definitions, so no eager-registry fallback occurred. No external web search was executed.
+
+Sanitized reports (no user prompts, keys, or tool documentation) are in `verification/`. The installed CLI checksum is recorded in the real-request report. The pinned upstream is HipFire, an original AMD inference engine by Kaden Schutt, under its existing Apache-2.0 / per-file license notices; this kit retains the upstream notices in modified source files.
+
 ## Verification performed
 
 The patch was tested in a temporary worktree based on the commit above:
 
-- Anthropic adapter tests: 18 passed, including a mixed native-search/client-tool round trip.
+- Anthropic adapter tests after the deferred-tool fix: 22 passed, including deferred-schema filtering, reference validation, count/generation projection parity, and the existing native-search/client-tool round trip.
 - DeepSeek web-search tests: passed, including key precedence, a local mock Search API request, result-to-Anthropic mapping, and continuation decoding.
 - HipFire CLI tests: 877 passed, 0 failed, 1 ignored. HipFire daemon tests: 62 passed, 0 failed.
 - Pending search/server result ordering test: passed without a network call.

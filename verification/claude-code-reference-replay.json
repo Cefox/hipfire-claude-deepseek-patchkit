@@ -1,0 +1,15 @@
+{
+  "source": "Local Claude Code 2.1.310 request schema and ToolSearch result, prompts not published",
+  "http_status": 200,
+  "request_tool_definitions": 14,
+  "count_tokens": 14875,
+  "generation_input_tokens": 14875,
+  "output_tokens": 16,
+  "stop_reason": "max_tokens",
+  "eager_fallback_tool_definitions": 232,
+  "eager_fallback_input_tokens": 273472,
+  "model_context": 262144,
+  "forced_npu": true,
+  "installed_cli_sha256": "47dc68608f6d7633f0d808b3deb9a19413f62569cc2c13a5eedbb06dd4acc3ad",
+  "passed": true
+}

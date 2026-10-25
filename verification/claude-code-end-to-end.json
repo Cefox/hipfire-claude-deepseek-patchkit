@@ -1,0 +1,41 @@
+{
+  "cli_exit_code": 0,
+  "elapsed_seconds": 16.02,
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "num_turns": 2,
+  "result": "OK",
+  "usage": {
+    "input_tokens": 27100,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 115,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "request_tool_definition_counts": [
+    12,
+    13
+  ],
+  "tool_reference_blocks": 1,
+  "client_tools_called": [
+    "ToolSearch"
+  ],
+  "api_error_messages": 0,
+  "external_search_requests": 0
+}

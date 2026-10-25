@@ -1,0 +1,20 @@
+{
+  "model": "qwen3.8:flash-next",
+  "deferred_tools": 232,
+  "wire_tool_json_bytes": 1172342,
+  "baseline_input_tokens": 278,
+  "dormant_tools_input_tokens": 278,
+  "initial": {
+    "count_tokens": 278,
+    "generation_input_tokens": 278,
+    "output_tokens": 2,
+    "stop_reason": "end_turn"
+  },
+  "tool_reference_follow_up": {
+    "count_tokens": 1201,
+    "generation_input_tokens": 1201,
+    "output_tokens": 2,
+    "stop_reason": "end_turn"
+  },
+  "passed": true
+}

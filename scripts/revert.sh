@@ -3,9 +3,18 @@ set -euo pipefail
 
 KIT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH_FILE="$KIT_DIR/patches/hipfire-claude-deepseek-master-56367a7.patch"
+DEFERRED_PATCH="$KIT_DIR/patches/hipfire-claude-deferred-tools.patch"
 SOURCE_DIR="${1:-${HOME}/.hipfire/src}"
 
+deferred_reverted=false
+if git -C "$SOURCE_DIR" apply --reverse --check "$DEFERRED_PATCH" >/dev/null 2>&1; then
+  git -C "$SOURCE_DIR" apply --reverse "$DEFERRED_PATCH"
+  deferred_reverted=true
+fi
 if ! git -C "$SOURCE_DIR" apply --reverse --check "$PATCH_FILE"; then
+  if $deferred_reverted; then
+    git -C "$SOURCE_DIR" apply "$DEFERRED_PATCH"
+  fi
   echo "The patch is not cleanly applied in $SOURCE_DIR; refusing to revert." >&2
   exit 1
 fi
