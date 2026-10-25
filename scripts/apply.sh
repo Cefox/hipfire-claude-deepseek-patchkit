@@ -6,6 +6,7 @@ PATCHES=(
   "$KIT_DIR/patches/hipfire-claude-deepseek-master-56367a7.patch"
   "$KIT_DIR/patches/hipfire-claude-deferred-tools.patch"
   "$KIT_DIR/patches/hipfire-server-search-config.patch"
+  "$KIT_DIR/patches/hipfire-search-settings-tui.patch"
 )
 if ! git -C "$SOURCE_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
   echo "Not a Git worktree: $SOURCE_DIR" >&2
@@ -39,4 +40,4 @@ for ((i=start; i<${#PATCHES[@]}; i++)); do
   fi
   applied+=("${PATCHES[i]}")
 done
-echo "Patches applied. Build hipfire-cli and hipfire-daemon, then restart HipFire."
+echo "Patches applied. Build/install hipfire-cli, hipfire-daemon and hipfire-tui, then restart/reopen HipFire."

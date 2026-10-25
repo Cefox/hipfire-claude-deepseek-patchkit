@@ -26,24 +26,34 @@ If you specifically want to patch your older standalone clone instead, pass its 
 ./scripts/apply.sh /path/to/your/hipfire-clone
 ```
 
-The script applies the original compatibility patch, the deferred-tool patch, and the server-search-config patch in order. It also upgrades a source tree that already has the original patch or the deferred-tool update, detects an already-completed upgrade, and refuses unrelated dirty source trees. Each patch is checked before application; if any patch fails, only patches newly applied by that invocation are rolled back. If the patch no longer applies cleanly after a later upstream change, stop and rebase/review it; do not force-apply it.
+The script applies the original compatibility patch, the deferred-tool patch, the server-search-config patch, and the TUI settings patch in order. It also upgrades a source tree that already has the original patch or the deferred-tool update, detects an already-completed upgrade, and refuses unrelated dirty source trees. Each patch is checked before application; if any patch fails, only patches newly applied by that invocation are rolled back. If the patch no longer applies cleanly after a later upstream change, stop and rebase/review it; do not force-apply it.
 
-Build the changed binaries from that source tree:
+Build and install all three components automatically with backups:
+
+```bash
+./scripts/build-install.sh "$HOME/.hipfire/src"
+```
+
+The config interface is a separate `hipfire-tui` executable linked against the configuration schema. Updating only `hipfire` and `daemon` leaves the old interface unaware of newly added settings. Close any already-open settings interface and run `hipfire config` again after installing.
+
+Alternatively, build the changed binaries from that source tree:
 
 ```bash
 cd "$HOME/.hipfire/src"
-cargo build --release --locked -p hipfire-cli -p hipfire-daemon
+cargo build --release --locked -p hipfire-cli -p hipfire-daemon -p hipfire-tui
 ```
 
-The patch script intentionally does not overwrite binaries or restart a running service. For the standard managed installation, back up and replace both binaries after the build:
+The patch script intentionally does not overwrite binaries or restart a running service. For the standard managed installation, back up and replace all three binaries after the build:
 
 ```bash
 backup="$HOME/.hipfire/backups/hipfire-patch-$(date -u +%Y%m%dT%H%M%SZ)"
 install -d -m 700 "$backup"
 cp -p "$HOME/.hipfire/bin/hipfire" "$backup/hipfire"
 cp -p "$HOME/.hipfire/bin/daemon" "$backup/daemon"
+cp -p "$HOME/.hipfire/bin/hipfire-tui" "$backup/hipfire-tui"
 install -m 755 "$HOME/.hipfire/src/target/release/hipfire" "$HOME/.hipfire/bin/hipfire"
 install -m 755 "$HOME/.hipfire/src/target/release/daemon" "$HOME/.hipfire/bin/daemon"
+install -m 755 "$HOME/.hipfire/src/target/release/hipfire-tui" "$HOME/.hipfire/bin/hipfire-tui"
 ```
 
 Start HipFire again using your normal service command. The backup directory contains the previous binaries for rollback. If rolling back to a binary without this configuration patch, first reset `serve.deepseek_api_key_file` and `serve.deepseek_search_url` with the patched CLI so the older schema does not encounter unknown keys. To remove the patch before applying another version, stop HipFire and run:
@@ -70,6 +80,8 @@ hipfire config set serve.deepseek_search_url https://api.deepseek.com/v1/tools/s
 ```
 
 You can also create your own private key file and pass its absolute path to `hipfire config set`. The key must contain at least 32 printable ASCII bytes, with no spaces; a final newline is allowed. The helper accepts an optional absolute key-file path and optional endpoint URL as its first and second arguments.
+
+In the interactive `hipfire config` interface, choose **Advanced** in **Global** scope, or press `/` and search `deepseek`. The two editable rows are **DeepSeek Search key file** (`serve.deepseek_api_key_file`) and **DeepSeek Search API URL** (`serve.deepseek_search_url`). The first edits the private key file's path; it does not display or edit the key contents. Press Enter to edit and use the interface's Save action to persist. Restart serve after changing these process settings.
 
 Inspect or clear the configuration using the native commands:
 
@@ -145,6 +157,10 @@ CC Switch provider settings for Claude Code:
 | Thinking | Keep enabled; do not set a thinking-disable variable |
 
 These values are guidance for CC Switch; this package does not edit the client’s personal provider settings. Verify that TCP port 11435 is reachable from the intended host. When bearer authentication is enabled, the provider API key must match the server token.
+
+## Config interface verification (2026-10-25)
+
+The TUI fix passed 16 settings-model tests. A real terminal run confirmed that searching `deepseek` shows the two Search settings and their current values in Advanced, editing all models. The installed `hipfire-tui` checksum matches that verified build. All four source patches were checked for fresh apply, upgrade from each preceding version, repeat apply, and full revert. `scripts/build-install.sh` was also exercised on the managed installation, including backups and atomic replacement of all three executables. See `verification/search-settings-tui.json`.
 
 ## Server-owned search configuration verification (2026-10-25)
 

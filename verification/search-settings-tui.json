@@ -1,0 +1,31 @@
+{
+  "settings_model_tests_passed": 16,
+  "interactive_terminal_search_verified": true,
+  "installed_tui_matches_verified_build": true,
+  "installed_tui_sha256": "e124534b0d6724997e25efeb93e77cdd9a7001002bdbba9aef88680422719896",
+  "group": "Advanced",
+  "scope": "all models (Global)",
+  "search": "deepseek",
+  "visible_settings": [
+    {
+      "key": "serve.deepseek_api_key_file",
+      "title": "DeepSeek Search key file"
+    },
+    {
+      "key": "serve.deepseek_search_url",
+      "title": "DeepSeek Search API URL"
+    }
+  ],
+  "upgrade_apply_revert_states_tested": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "installer_components": [
+    "hipfire",
+    "daemon",
+    "hipfire-tui"
+  ]
+}

@@ -1,0 +1,55 @@
+diff --git a/crates/hipfire-tui/src/hipfire/settings_model.rs b/crates/hipfire-tui/src/hipfire/settings_model.rs
+--- a/crates/hipfire-tui/src/hipfire/settings_model.rs
++++ b/crates/hipfire-tui/src/hipfire/settings_model.rs
+@@ -723,6 +723,11 @@
+ 
+ /// Plain title when the knob tables have one, else the canonical key.
+ pub(crate) fn row_title(key: &str) -> String {
++    match key {
++        "serve.deepseek_api_key_file" => return "DeepSeek Search key file".to_owned(),
++        "serve.deepseek_search_url" => return "DeepSeek Search API URL".to_owned(),
++        _ => {}
++    }
+     if let Some(knob) = knobs::curated_knob(key) {
+         return knob.title.to_owned();
+     }
+@@ -1117,6 +1122,39 @@
+     }
+ 
+     #[test]
++    fn search_settings_are_visible_with_configured_values_in_advanced() {
++        let (paths, root) = fixture_home("deepseek-search-settings");
++        let key_file = root.join("deepseek-api-key");
++        let config = format!(
++            "[serve]\ndeepseek_api_key_file = {:?}\ndeepseek_search_url = \"https://api.deepseek.com/v1/tools/search\"\n",
++            key_file.to_str().unwrap()
++        );
++        write_config(&paths, &config);
++        let model = build(
++            &paths,
++            &registry(CARD),
++            &arch("gfx1151", A8Prefill::NotLanded),
++            &ConfigLayer::default(),
++        );
++        let hits = model.search(&RowFilter {
++            search: "deepseek".into(),
++            ..RowFilter::default()
++        });
++        for (key, title, value) in [
++            ("serve.deepseek_api_key_file", "DeepSeek Search key file", key_file.to_str().unwrap()),
++            ("serve.deepseek_search_url", "DeepSeek Search API URL", "https://api.deepseek.com/v1/tools/search"),
++        ] {
++            let setting = row(&model, key);
++            assert_eq!(setting.group, Intent::Advanced);
++            assert_eq!(setting.title, title);
++            assert_eq!(setting.display, value);
++            assert!(!setting.is_unused());
++            assert!(hits.iter().any(|hit| hit.id == RowId::Key(key.into())));
++        }
++        let _ = std::fs::remove_dir_all(root);
++    }
++
++    #[test]
+     fn changed_only_and_hide_unused_filters() {
+         let (paths, root) = fixture_home("filters");
+         write_config(&paths, "[reasoning]\neffort = \"low\"\n");
