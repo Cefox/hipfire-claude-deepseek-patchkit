@@ -987,7 +987,7 @@ index 31bf65e6c..8a71f3f65 100644
      fn tools_absent_bypasses_adapter_capability_gate() {
          let mutations = std::sync::atomic::AtomicUsize::new(0);
 diff --git a/crates/hipfire-cli/src/serve/http.rs b/crates/hipfire-cli/src/serve/http.rs
-index d12e21748..0d5b0e658 100644
+index d12e21748..d12f2a44d 100644
 --- a/crates/hipfire-cli/src/serve/http.rs
 +++ b/crates/hipfire-cli/src/serve/http.rs
 @@ -14,7 +14,7 @@ use crate::serve::complete::{
@@ -1081,7 +1081,23 @@ index d12e21748..0d5b0e658 100644
  /// One generation request on any [`WireApi`]: body limit, lowering onto the
  /// chat-completions body, then the chat route's admission (same batching
  /// eligibility, same model lease), tool gate and worker. A Messages or
-@@ -1356,6 +1415,20 @@ async fn handle_generation(
+@@ -1330,6 +1389,15 @@ async fn handle_generation(
+     acks: FlushAcks,
+     api: WireApi,
+ ) -> Response<BoxBody> {
++    let request_search_key = if api == WireApi::AnthropicMessages {
++        web_search::normalize_request_key(
++            req.headers()
++                .get(web_search::API_KEY_HEADER)
++                .and_then(|value| value.to_str().ok()),
++        )
++    } else {
++        None
++    };
+     let max_bytes = shared.max_request_bytes;
+     if req
+         .headers()
+@@ -1356,6 +1424,20 @@ async fn handle_generation(
          Ok(request) => request,
          Err(message) => return api.error_response(&message, 400),
      };
@@ -1092,9 +1108,9 @@ index d12e21748..0d5b0e658 100644
 +                403,
 +            );
 +        }
-+        if !web_search::api_key_configured() {
++        if !web_search::api_key_configured(request_search_key.as_deref()) {
 +            return api.error_response(
-+                "Claude native web search is enabled for this request, but HIPFIRE_DEEPSEEK_API_KEY (or DEEPSEEK_API_KEY) is not set in the HipFire server environment",
++                "Claude native web search needs X-HipFire-DeepSeek-API-Key, HIPFIRE_DEEPSEEK_API_KEY, or DEEPSEEK_API_KEY",
 +                503,
 +            );
 +        }
@@ -1102,7 +1118,37 @@ index d12e21748..0d5b0e658 100644
  
      let (is_eligible, model_for_lease) = {
          let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-@@ -1451,7 +1524,7 @@ async fn handle_embeddings(
+@@ -1408,9 +1490,27 @@ async fn handle_generation(
+     }
+ 
+     let response = if is_stream {
+-        handle_streaming(shared, body_val, encoding, guard, cancelled, acks).await
++        handle_streaming(
++            shared,
++            body_val,
++            request_search_key,
++            encoding,
++            guard,
++            cancelled,
++            acks,
++        )
++        .await
+     } else {
+-        handle_nonstreaming(shared, body_val, encoding, guard, cancelled, acks).await
++        handle_nonstreaming(
++            shared,
++            body_val,
++            request_search_key,
++            encoding,
++            guard,
++            cancelled,
++            acks,
++        )
++        .await
+     };
+     cancel_guard.disarm();
+     response
+@@ -1451,7 +1551,7 @@ async fn handle_embeddings(
          other => {
              return Err(format!(
                  "kind {other:?} unsupported: expected \"query\" or \"document\""
@@ -1111,7 +1157,7 @@ index d12e21748..0d5b0e658 100644
          }
      };
      // One input per HTTP request; the multi-slot engine batches concurrent
-@@ -1490,7 +1563,7 @@ async fn handle_embeddings(
+@@ -1490,7 +1590,7 @@ async fn handle_embeddings(
                      WireApi::ChatCompletions,
                      &shared.metrics,
                      &error,
@@ -1120,7 +1166,7 @@ index d12e21748..0d5b0e658 100644
              }
          }
      } else {
-@@ -1505,7 +1578,7 @@ async fn handle_embeddings(
+@@ -1505,7 +1605,7 @@ async fn handle_embeddings(
                      WireApi::ChatCompletions,
                      &shared.metrics,
                      &error,
@@ -1129,7 +1175,7 @@ index d12e21748..0d5b0e658 100644
              }
          }
      };
-@@ -1732,7 +1805,7 @@ async fn handle_images_generations(
+@@ -1732,7 +1832,7 @@ async fn handle_images_generations(
                  WireApi::ChatCompletions,
                  &shared.metrics,
                  &error,
@@ -1138,7 +1184,7 @@ index d12e21748..0d5b0e658 100644
          }
      };
  
-@@ -2053,6 +2126,289 @@ fn images_error_status(message: &str) -> u16 {
+@@ -2053,6 +2153,292 @@ fn images_error_status(message: &str) -> u16 {
  // Streaming / Non-streaming handlers
  // ---------------------------------------------------------------------------
  
@@ -1162,6 +1208,7 @@ index d12e21748..0d5b0e658 100644
 +fn resolve_pending_web_searches(
 +    body: &mut serde_json::Value,
 +    config: &serde_json::Value,
++    request_key: Option<&str>,
 +    server_blocks: &Arc<Mutex<Vec<serde_json::Value>>>,
 +    search_uses: &mut usize,
 +    search_index: &mut usize,
@@ -1222,7 +1269,7 @@ index d12e21748..0d5b0e658 100644
 +                web_search::max_uses_exceeded(call_id, &arguments)
 +            } else {
 +                *search_uses += 1;
-+                web_search::execute(call_id, &arguments, config)
++                web_search::execute(call_id, &arguments, config, request_key)
 +            };
 +            *search_index += 1;
 +            {
@@ -1253,6 +1300,7 @@ index d12e21748..0d5b0e658 100644
 +    shared: &ServeShared,
 +    initial_body: serde_json::Value,
 +    initial_guard: AdmissionGuard,
++    request_key: Option<&str>,
 +    request_identity: Option<(String, u64)>,
 +    cancelled: &std::sync::atomic::AtomicBool,
 +    server_blocks: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -1282,6 +1330,7 @@ index d12e21748..0d5b0e658 100644
 +    resolve_pending_web_searches(
 +        &mut body,
 +        &config,
++        request_key,
 +        &server_blocks,
 +        &mut search_uses,
 +        &mut search_index,
@@ -1359,7 +1408,7 @@ index d12e21748..0d5b0e658 100644
 +                web_search::max_uses_exceeded(&server_id, &call.arguments)
 +            } else {
 +                search_uses += 1;
-+                web_search::execute(&server_id, &call.arguments, &config)
++                web_search::execute(&server_id, &call.arguments, &config, request_key)
 +            };
 +            {
 +                let mut blocks = server_blocks
@@ -1428,7 +1477,15 @@ index d12e21748..0d5b0e658 100644
  /// Longest an SSE client goes without a byte. A stream commits (200 + role
  /// chunk) when the worker sends its first frame; if generation is still
  /// silent this long after admission (cold load, long prefill), it commits
-@@ -2096,15 +2452,29 @@ async fn handle_streaming(
+@@ -2064,6 +2450,7 @@ const SSE_SILENCE_LIMIT: Duration = Duration::from_secs(15);
+ async fn handle_streaming(
+     shared: Arc<ServeShared>,
+     body: serde_json::Value,
++    request_key: Option<String>,
+     encoding: ResponseEncoding,
+     guard: AdmissionGuard,
+     cancelled: Arc<AtomicBool>,
+@@ -2096,15 +2483,30 @@ async fn handle_streaming(
      let worker_shared = Arc::clone(&shared);
      tokio::task::spawn_blocking(move || {
          let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1447,6 +1504,7 @@ index d12e21748..0d5b0e658 100644
 +                    &worker_shared,
 +                    body,
 +                    guard,
++                    request_key.as_deref(),
 +                    Some((sink.id.clone(), sink.created)),
 +                    &cancelled,
 +                    Arc::clone(&blocks),
@@ -1467,7 +1525,15 @@ index d12e21748..0d5b0e658 100644
          }));
          let result = outcome.unwrap_or_else(|payload| {
              Err(anyhow!(
-@@ -2170,13 +2540,24 @@ async fn handle_nonstreaming(
+@@ -2150,6 +2552,7 @@ async fn handle_streaming(
+ async fn handle_nonstreaming(
+     shared: Arc<ServeShared>,
+     body: serde_json::Value,
++    request_key: Option<String>,
+     encoding: ResponseEncoding,
+     guard: AdmissionGuard,
+     cancelled: Arc<AtomicBool>,
+@@ -2170,13 +2573,24 @@ async fn handle_nonstreaming(
      tokio::task::spawn_blocking(move || {
          let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
              let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
@@ -1498,7 +1564,7 @@ index d12e21748..0d5b0e658 100644
                  if bytes.is_empty() {
                      return Err(hipfire_client::ClientError::Protocol(
                          "nonstream terminal body must be non-empty".into(),
-@@ -2199,15 +2580,28 @@ async fn handle_nonstreaming(
+@@ -2199,15 +2613,29 @@ async fn handle_nonstreaming(
                      Err(()) => Err(hipfire_client::ClientError::Cancelled),
                  }
              };
@@ -1516,6 +1582,7 @@ index d12e21748..0d5b0e658 100644
 +                    &shared_clone,
 +                    body_for_worker,
 +                    guard,
++                    request_key.as_deref(),
 +                    None,
 +                    &cancelled,
 +                    server_blocks,
@@ -1536,7 +1603,7 @@ index d12e21748..0d5b0e658 100644
          }));
          // If terminal was never staged, propagate preterminal error via staged channel.
          let mut lock = staged_tx_clone
-@@ -2554,6 +2948,44 @@ mod tests {
+@@ -2554,6 +2982,45 @@ mod tests {
      use std::task::Waker;
      use std::time::Duration;
  
@@ -1560,6 +1627,7 @@ index d12e21748..0d5b0e658 100644
 +        resolve_pending_web_searches(
 +            &mut body,
 +            &serde_json::json!({}),
++            None,
 +            &blocks,
 +            &mut search_uses,
 +            &mut search_index,
@@ -1595,10 +1663,10 @@ index 22656b17f..3fbd76ce3 100644
  pub(crate) struct ServeMeta {
 diff --git a/crates/hipfire-cli/src/serve/web_search.rs b/crates/hipfire-cli/src/serve/web_search.rs
 new file mode 100644
-index 000000000..b16ad22e9
+index 000000000..ab6f59bc3
 --- /dev/null
 +++ b/crates/hipfire-cli/src/serve/web_search.rs
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,481 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -1610,6 +1678,7 @@ index 000000000..b16ad22e9
 +use std::time::Duration;
 +
 +pub(crate) const INTERNAL_TOOL_NAME: &str = "__hipfire_deepseek_web_search";
++pub(crate) const API_KEY_HEADER: &str = "x-hipfire-deepseek-api-key";
 +const SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
 +const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 +const MAX_DOMAINS: usize = 32;
@@ -1621,24 +1690,44 @@ index 000000000..b16ad22e9
 +    pub(crate) model_result: String,
 +}
 +
-+pub(crate) fn api_key_configured() -> bool {
-+    api_key().is_some()
++pub(crate) fn api_key_configured(request_key: Option<&str>) -> bool {
++    api_key(request_key).is_some()
 +}
 +
-+fn api_key() -> Option<String> {
-+    std::env::var("HIPFIRE_DEEPSEEK_API_KEY")
-+        .ok()
-+        .filter(|value| !value.trim().is_empty())
-+        .or_else(|| {
-+            std::env::var("DEEPSEEK_API_KEY")
-+                .ok()
-+                .filter(|value| !value.trim().is_empty())
-+        })
++pub(crate) fn normalize_request_key(value: Option<&str>) -> Option<String> {
++    value
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++        .map(str::to_owned)
++}
++
++fn api_key(request_key: Option<&str>) -> Option<String> {
++    let hipfire_key = std::env::var("HIPFIRE_DEEPSEEK_API_KEY").ok();
++    let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok();
++    select_api_key(request_key, hipfire_key.as_deref(), deepseek_key.as_deref())
++}
++
++fn select_api_key(
++    request_key: Option<&str>,
++    hipfire_key: Option<&str>,
++    deepseek_key: Option<&str>,
++) -> Option<String> {
++    [request_key, hipfire_key, deepseek_key]
++        .into_iter()
++        .flatten()
++        .map(str::trim)
++        .find(|value| !value.is_empty())
++        .map(str::to_owned)
 +}
 +
 +/// Parse tool arguments, apply Anthropic's domain policy using DeepSeek's
 +/// `site:` query operators, and execute one DeepSeek Search API request.
-+pub(crate) fn execute(tool_use_id: &str, input: &Value, config: &Value) -> SearchOutput {
++pub(crate) fn execute(
++    tool_use_id: &str,
++    input: &Value,
++    config: &Value,
++    request_key: Option<&str>,
++) -> SearchOutput {
 +    let query = input
 +        .get("query")
 +        .and_then(Value::as_str)
@@ -1653,7 +1742,7 @@ index 000000000..b16ad22e9
 +        "type":"server_tool_use", "id":tool_use_id, "name":name, "input":input
 +    });
 +
-+    let (content, model_result) = match search_content(&query, config) {
++    let (content, model_result) = match search_content_at(&query, config, request_key, SEARCH_URL) {
 +        Ok((blocks, text)) => (Value::Array(blocks), text),
 +        Err(code) => (
 +            json!({"type":"web_search_tool_result_error", "error_code":code}),
@@ -1693,7 +1782,12 @@ index 000000000..b16ad22e9
 +    }
 +}
 +
-+fn search_content(query: &str, config: &Value) -> Result<(Vec<Value>, String), &'static str> {
++fn search_content_at(
++    query: &str,
++    config: &Value,
++    request_key: Option<&str>,
++    search_url: &str,
++) -> Result<(Vec<Value>, String), &'static str> {
 +    if query.is_empty() {
 +        return Err("invalid_tool_input");
 +    }
@@ -1718,7 +1812,7 @@ index 000000000..b16ad22e9
 +    if query.chars().count() > 128 {
 +        return Err("query_too_long");
 +    }
-+    let key = api_key().ok_or("unavailable")?;
++    let key = api_key(request_key).ok_or("unavailable")?;
 +    let agent: ureq::Agent = ureq::Agent::config_builder()
 +        .timeout_global(Some(SEARCH_TIMEOUT))
 +        .http_status_as_error(false)
@@ -1726,7 +1820,7 @@ index 000000000..b16ad22e9
 +        .build()
 +        .into();
 +    let mut response = agent
-+        .post(SEARCH_URL)
++        .post(search_url)
 +        .header("Authorization", &format!("Bearer {key}"))
 +        .header("Content-Type", "application/json")
 +        .send(json!({"query":query, "count":10, "need_content":false}).to_string())
@@ -1873,9 +1967,12 @@ index 000000000..b16ad22e9
 +
 +    #[test]
 +    fn malformed_and_long_queries_fail_closed_without_network_access() {
-+        assert_eq!(search_content("", &json!({})), Err("invalid_tool_input"));
 +        assert_eq!(
-+            search_content(&"x".repeat(129), &json!({})),
++            search_content_at("", &json!({}), None, SEARCH_URL),
++            Err("invalid_tool_input")
++        );
++        assert_eq!(
++            search_content_at(&"x".repeat(129), &json!({}), None, SEARCH_URL),
 +            Err("query_too_long")
 +        );
 +    }
@@ -1883,13 +1980,20 @@ index 000000000..b16ad22e9
 +    #[test]
 +    fn domain_filters_are_validated_before_api_key_lookup() {
 +        assert_eq!(
-+            search_content("hipfire", &json!({"allowed_domains":"github.com"})),
++            search_content_at(
++                "hipfire",
++                &json!({"allowed_domains":"github.com"}),
++                None,
++                SEARCH_URL
++            ),
 +            Err("invalid_tool_input")
 +        );
 +        assert_eq!(
-+            search_content(
++            search_content_at(
 +                "hipfire",
-+                &json!({"allowed_domains":["https://github.com"]})
++                &json!({"allowed_domains":["https://github.com"]}),
++                None,
++                SEARCH_URL,
 +            ),
 +            Err("invalid_tool_input")
 +        );
@@ -1898,7 +2002,12 @@ index 000000000..b16ad22e9
 +    #[test]
 +    fn invalid_domain_control_cannot_be_ignored() {
 +        assert_eq!(
-+            search_content("hipfire", &json!({"blocked_domains":["bad domain"]})),
++            search_content_at(
++                "hipfire",
++                &json!({"blocked_domains":["bad domain"]}),
++                None,
++                SEARCH_URL,
++            ),
 +            Err("invalid_tool_input")
 +        );
 +    }
@@ -1938,6 +2047,105 @@ index 000000000..b16ad22e9
 +        assert!(model_text.contains("The release adds native web search."));
 +        let result = json!({"content":[blocks[0].clone()]});
 +        assert!(continuation_text(&result).contains("The release adds native web search."));
++    }
++
++    #[test]
++    fn request_key_precedes_server_environment_keys() {
++        assert_eq!(
++            select_api_key(
++                Some("  ccswitch-key  "),
++                Some("hipfire-env-key"),
++                Some("deepseek-env-key")
++            ),
++            Some("ccswitch-key".to_owned())
++        );
++        assert_eq!(
++            select_api_key(None, Some(" hipfire-env-key "), Some("deepseek-env-key")),
++            Some("hipfire-env-key".to_owned())
++        );
++        assert_eq!(
++            select_api_key(Some("  "), None, Some("fallback")),
++            Some("fallback".to_owned())
++        );
++        assert_eq!(select_api_key(None, None, Some("  ")), None);
++        assert_eq!(
++            normalize_request_key(Some("  header-key  ")),
++            Some("header-key".to_owned())
++        );
++        assert_eq!(normalize_request_key(Some(" \t ")), None);
++        assert_eq!(normalize_request_key(None), None);
++    }
++
++    #[test]
++    fn ccswitch_request_key_authenticates_a_local_search_request() {
++        use std::io::{Read, Write};
++        use std::net::TcpListener;
++        use std::thread;
++
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = listener.local_addr().unwrap();
++        let server = thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            let mut received = Vec::new();
++            let mut chunk = [0u8; 4096];
++            loop {
++                let read = stream.read(&mut chunk).unwrap();
++                if read == 0 {
++                    break;
++                }
++                received.extend_from_slice(&chunk[..read]);
++                let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n")
++                else {
++                    continue;
++                };
++                let headers = String::from_utf8_lossy(&received[..header_end]);
++                let content_length = headers
++                    .lines()
++                    .find_map(|line| {
++                        let (name, value) = line.split_once(':')?;
++                        name.eq_ignore_ascii_case("content-length")
++                            .then(|| value.trim().parse::<usize>().ok())
++                            .flatten()
++                    })
++                    .unwrap_or(0);
++                if received.len() >= header_end + 4 + content_length {
++                    break;
++                }
++            }
++            let request = String::from_utf8_lossy(&received).into_owned();
++            let response_body = r#"{"results":[{"title":"Local test","url":"https://example.test","summary":"Mock result"}]}"#;
++            write!(
++                stream,
++                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
++                response_body.len(),
++                response_body
++            )
++            .unwrap();
++            request
++        });
++
++        let url = format!("http://{address}/v1/tools/search");
++        let (blocks, text) = search_content_at(
++            "HipFire local test",
++            &json!({}),
++            Some("ccswitch-test-secret"),
++            &url,
++        )
++        .unwrap();
++        assert_eq!(blocks[0]["title"], "Local test");
++        assert!(text.contains("Mock result"));
++
++        let request = server.join().unwrap();
++        let authorization = request
++            .lines()
++            .find(|line| {
++                line.split_once(':')
++                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
++            })
++            .unwrap();
++        assert!(authorization.ends_with("Bearer ccswitch-test-secret"));
++        let body = request.split_once("\r\n\r\n").unwrap().1;
++        assert!(!body.contains("ccswitch-test-secret"));
 +    }
 +}
 diff --git a/crates/hipfire-daemon/src/main.rs b/crates/hipfire-daemon/src/main.rs

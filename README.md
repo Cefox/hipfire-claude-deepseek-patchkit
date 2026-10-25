@@ -42,7 +42,23 @@ Then install/restart them through your normal HipFire setup procedure. The patch
 
 ## DeepSeek Search API setup
 
-The HipFire process needs one of these environment variables:
+The patched HipFire server accepts the DeepSeek key either in a Claude Code request header or from its own process environment. When both are present, the request header takes precedence. The header name is `X-HipFire-DeepSeek-API-Key`.
+
+### Configure both keys through CC Switch
+
+In the Claude Code provider editor, set the protocol to Anthropic Messages, the base URL to `http://127.0.0.1:11435`, and enter the HipFire bearer token in the provider's **API Key** field. CC Switch maps that provider credential to Claude Code's `ANTHROPIC_AUTH_TOKEN`; it must match the token configured by HipFire's `serve.api_key_file`.
+
+Then add the DeepSeek Search key in the Claude Code config JSON editor at the bottom of the provider editor. Preserve the existing JSON and add this property inside its `env` object:
+
+```json
+"ANTHROPIC_CUSTOM_HEADERS": "X-HipFire-DeepSeek-API-Key: <DEEPSEEK_SEARCH_API_KEY>"
+```
+
+Replace the placeholder with your DeepSeek API key. Claude Code requires version 2.1.227 or newer for `ANTHROPIC_CUSTOM_HEADERS`; this host has 2.1.310. CC Switch v4.0.19 writes custom environment variables from this editor to the global `~/.claude/settings.json`, so the DeepSeek header is sent to whichever Claude Code provider is selected. Remove it from the editor before switching to another provider. The value is stored in that JSON file; treat the file as a secret. Keep the HipFire base URL on `127.0.0.1` when CC Switch and HipFire run on the same machine, because plain HTTP over a LAN would expose the header in transit. See the [Claude Code environment-variable reference](https://code.claude.com/docs/en/env-vars) and [CC Switch provider editor guide](https://github.com/farion1231/cc-switch/blob/v4.0.19/docs/user-manual/en/2-providers/2.3-edit.md).
+
+### Configure the key in the HipFire service instead
+
+If you do not want Claude Code to send the DeepSeek key, set one of these variables in the HipFire process environment:
 
 - `HIPFIRE_DEEPSEEK_API_KEY` (preferred)
 - `DEEPSEEK_API_KEY` (fallback)
@@ -55,7 +71,7 @@ printf '\n'
 export HIPFIRE_DEEPSEEK_API_KEY
 ```
 
-For systemd, store it in a permission-restricted environment file and reference that file from the HipFire service unit; do not put the key in this patch kit or a shell command line. Because web search uses a server-held credential and the DeepSeek Search API is billed per successful request, HipFire requires `serve.api_key_file` to be configured as well. Set the matching bearer token in CC Switch. Search and Fetch are listed at $0.75 per 1,000 successful direct API requests in [DeepSeek’s Search & Fetch billing docs](https://api-docs.deepseek.com/guides/search/#billing); this patch calls the Search endpoint directly.
+For systemd, store it in a permission-restricted environment file and reference that file from the HipFire service unit; do not put the key in this patch kit or a shell command line. HipFire requires `serve.api_key_file` to be configured before enabling web search, and the matching bearer token belongs in CC Switch. Search and Fetch are listed at $0.75 per 1,000 successful direct API requests in [DeepSeek’s Search & Fetch billing docs](https://api-docs.deepseek.com/guides/search/#billing); this patch calls the Search endpoint directly.
 
 The adapter supports the basic `web_search_20250305` tool and direct-call use of the 20260209/20260318 variants. It refuses dynamic-filtering requests that require code execution, and it does not implement Claude’s separate `web_fetch` tool. Anthropic’s protocol requires a `server_tool_use` / `web_search_tool_result` pair; when mixed with client tools, the result is deferred until the client tool result arrives ([server tool protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/server-tools), [web search protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool)). DeepSeek’s API accepts `query`, `count`, `need_content`, domain operators, and returns ranked results with summary, snippet, URL, and date ([Search API](https://api-docs.deepseek.com/guides/search/)).
 
@@ -87,12 +103,13 @@ These values are guidance for CC Switch; this package does not edit the client�
 
 ## Verification performed
 
-The patch was built and tested in a temporary worktree based on the commit above, not installed into the live HipFire source:
+The patch was tested in a temporary worktree based on the commit above:
 
 - Anthropic adapter tests: 18 passed, including a mixed native-search/client-tool round trip.
-- DeepSeek web-search tests: 5 passed, including result-to-Anthropic mapping and continuation decoding.
+- DeepSeek web-search tests: passed, including key precedence, a local mock Search API request, result-to-Anthropic mapping, and continuation decoding.
+- HipFire CLI tests: 876 passed, 0 failed, 1 ignored. HipFire daemon tests: 62 passed, 0 failed.
 - Pending search/server result ordering test: passed without a network call.
 - Qwen4 inline-system adapter tests in generate and loader crates: passed.
 - Earlier checks on the same patch set also passed the tool-budget regression and `cargo check` for `hipfire-cli` and `hipfire-generate`.
 
-No live DeepSeek API call was made because it is billable and no credential was supplied. Install and run it on the live server only after applying the patch and building the binaries.
+No live DeepSeek API call was made because it is billable and no credential was supplied. The local mock test verifies the request's bearer header and response mapping without contacting DeepSeek.
