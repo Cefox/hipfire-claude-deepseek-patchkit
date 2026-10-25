@@ -1,0 +1,17 @@
+{
+  "serve_tests_passed": 260,
+  "config_tests_passed": 357,
+  "config_cli_helper": "private key file and native set/get/reset verified",
+  "private_key_mode": "0o600",
+  "client_custom_search_header_required": false,
+  "native_search_descriptor_request_without_custom_headers_http": 200,
+  "native_descriptor_diagnostic_tool_choice": "none; no external search execution",
+  "response_content": [
+    {
+      "type": "text",
+      "text": "OK"
+    }
+  ],
+  "paid_external_search_calls_in_validation": 0,
+  "installed_cli_sha256": "f88ae846761bb399d686738b543d03a8e06113a505fd4e8268e0ae666b94aa40"
+}

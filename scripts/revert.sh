@@ -1,23 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 KIT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-PATCH_FILE="$KIT_DIR/patches/hipfire-claude-deepseek-master-56367a7.patch"
-DEFERRED_PATCH="$KIT_DIR/patches/hipfire-claude-deferred-tools.patch"
 SOURCE_DIR="${1:-${HOME}/.hipfire/src}"
-
-deferred_reverted=false
-if git -C "$SOURCE_DIR" apply --reverse --check "$DEFERRED_PATCH" >/dev/null 2>&1; then
-  git -C "$SOURCE_DIR" apply --reverse "$DEFERRED_PATCH"
-  deferred_reverted=true
+PATCHES=(
+  "$KIT_DIR/patches/hipfire-claude-deepseek-master-56367a7.patch"
+  "$KIT_DIR/patches/hipfire-claude-deferred-tools.patch"
+  "$KIT_DIR/patches/hipfire-server-search-config.patch"
+)
+if ! git -C "$SOURCE_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "Not a Git worktree: $SOURCE_DIR" >&2
+  exit 2
 fi
-if ! git -C "$SOURCE_DIR" apply --reverse --check "$PATCH_FILE"; then
-  if $deferred_reverted; then
-    git -C "$SOURCE_DIR" apply "$DEFERRED_PATCH"
+
+start=-1
+for ((i=${#PATCHES[@]}-1; i>=0; i--)); do
+  if git -C "$SOURCE_DIR" apply --reverse --check "${PATCHES[i]}" >/dev/null 2>&1; then
+    start=$i
+    break
   fi
-  echo "The patch is not cleanly applied in $SOURCE_DIR; refusing to revert." >&2
+done
+if (( start < 0 )); then
+  echo "No recognized patch state; refusing to revert $SOURCE_DIR" >&2
   exit 1
 fi
-
-git -C "$SOURCE_DIR" apply --reverse "$PATCH_FILE"
-echo "Patch reverted from $SOURCE_DIR."
+reverted=()
+for ((i=start; i>=0; i--)); do
+  if ! git -C "$SOURCE_DIR" apply --reverse --check "${PATCHES[i]}" ||
+     ! git -C "$SOURCE_DIR" apply --reverse "${PATCHES[i]}"; then
+    for ((j=${#reverted[@]}-1; j>=0; j--)); do
+      git -C "$SOURCE_DIR" apply "${reverted[j]}"
+    done
+    echo "Revert failed; this invocation's changes were restored." >&2
+    exit 1
+  fi
+  reverted+=("${PATCHES[i]}")
+done
+echo "Patches reverted from $SOURCE_DIR."

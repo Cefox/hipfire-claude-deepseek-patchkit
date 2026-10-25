@@ -1,0 +1,619 @@
+diff --git a/crates/hipfire-cli/src/main.rs b/crates/hipfire-cli/src/main.rs
+--- a/crates/hipfire-cli/src/main.rs
++++ b/crates/hipfire-cli/src/main.rs
+@@ -16046,6 +16046,7 @@
+ 
+             let registry = hipfire_registry::bundled().unwrap();
+             let shared = Arc::new(ServeShared {
++                web_search: serve::web_search::SearchSettings::from_values("", "https://api.deepseek.com/v1/tools/search").unwrap(),
+                 capabilities: crate::serve::route_capabilities(
+                     false,
+                     4,
+diff --git a/crates/hipfire-cli/src/serve/http.rs b/crates/hipfire-cli/src/serve/http.rs
+--- a/crates/hipfire-cli/src/serve/http.rs
++++ b/crates/hipfire-cli/src/serve/http.rs
+@@ -1389,15 +1389,6 @@
+     acks: FlushAcks,
+     api: WireApi,
+ ) -> Response<BoxBody> {
+-    let request_search_key = if api == WireApi::AnthropicMessages {
+-        web_search::normalize_request_key(
+-            req.headers()
+-                .get(web_search::API_KEY_HEADER)
+-                .and_then(|value| value.to_str().ok()),
+-        )
+-    } else {
+-        None
+-    };
+     let max_bytes = shared.max_request_bytes;
+     if req
+         .headers()
+@@ -1424,23 +1415,14 @@
+         Ok(request) => request,
+         Err(message) => return api.error_response(&message, 400),
+     };
+-    if api == WireApi::AnthropicMessages && has_native_web_search(&body_val) {
+-        if web_search::requires_server_auth(
+-            request_search_key.as_deref(),
+-            web_search::server_api_key_configured(),
+-        ) && shared.api_key.is_none()
+-        {
+-            return api.error_response(
+-                "Claude native web search using a server-side DeepSeek key requires HipFire API authentication; configure serve.api_key_file or pass X-HipFire-DeepSeek-API-Key with the request",
+-                403,
+-            );
+-        }
+-        if !web_search::api_key_configured(request_search_key.as_deref()) {
+-            return api.error_response(
+-                "Claude native web search needs X-HipFire-DeepSeek-API-Key, HIPFIRE_DEEPSEEK_API_KEY, or DEEPSEEK_API_KEY",
+-                503,
+-            );
+-        }
++    if api == WireApi::AnthropicMessages
++        && has_native_web_search(&body_val)
++        && !shared.web_search.is_configured()
++    {
++        return api.error_response(
++            "Claude native web search requires a server-side key: hipfire config set serve.deepseek_api_key_file /absolute/path/to/key; restart serve after configuring it",
++            503,
++        );
+     }
+ 
+     let (is_eligible, model_for_lease) = {
+@@ -1494,27 +1476,9 @@
+     }
+ 
+     let response = if is_stream {
+-        handle_streaming(
+-            shared,
+-            body_val,
+-            request_search_key,
+-            encoding,
+-            guard,
+-            cancelled,
+-            acks,
+-        )
+-        .await
++        handle_streaming(shared, body_val, encoding, guard, cancelled, acks).await
+     } else {
+-        handle_nonstreaming(
+-            shared,
+-            body_val,
+-            request_search_key,
+-            encoding,
+-            guard,
+-            cancelled,
+-            acks,
+-        )
+-        .await
++        handle_nonstreaming(shared, body_val, encoding, guard, cancelled, acks).await
+     };
+     cancel_guard.disarm();
+     response
+@@ -2177,7 +2141,7 @@
+ fn resolve_pending_web_searches(
+     body: &mut serde_json::Value,
+     config: &serde_json::Value,
+-    request_key: Option<&str>,
++    settings: &web_search::SearchSettings,
+     server_blocks: &Arc<Mutex<Vec<serde_json::Value>>>,
+     search_uses: &mut usize,
+     search_index: &mut usize,
+@@ -2238,7 +2202,7 @@
+                 web_search::max_uses_exceeded(call_id, &arguments)
+             } else {
+                 *search_uses += 1;
+-                web_search::execute(call_id, &arguments, config, request_key)
++                web_search::execute(call_id, &arguments, config, settings)
+             };
+             *search_index += 1;
+             {
+@@ -2269,7 +2233,6 @@
+     shared: &ServeShared,
+     initial_body: serde_json::Value,
+     initial_guard: AdmissionGuard,
+-    request_key: Option<&str>,
+     request_identity: Option<(String, u64)>,
+     cancelled: &std::sync::atomic::AtomicBool,
+     server_blocks: Arc<Mutex<Vec<serde_json::Value>>>,
+@@ -2299,7 +2262,7 @@
+     resolve_pending_web_searches(
+         &mut body,
+         &config,
+-        request_key,
++        &shared.web_search,
+         &server_blocks,
+         &mut search_uses,
+         &mut search_index,
+@@ -2377,7 +2340,7 @@
+                 web_search::max_uses_exceeded(&server_id, &call.arguments)
+             } else {
+                 search_uses += 1;
+-                web_search::execute(&server_id, &call.arguments, &config, request_key)
++                web_search::execute(&server_id, &call.arguments, &config, &shared.web_search)
+             };
+             {
+                 let mut blocks = server_blocks
+@@ -2454,7 +2417,6 @@
+ async fn handle_streaming(
+     shared: Arc<ServeShared>,
+     body: serde_json::Value,
+-    request_key: Option<String>,
+     encoding: ResponseEncoding,
+     guard: AdmissionGuard,
+     cancelled: Arc<AtomicBool>,
+@@ -2493,7 +2455,6 @@
+                     &worker_shared,
+                     body,
+                     guard,
+-                    request_key.as_deref(),
+                     Some((sink.id.clone(), sink.created)),
+                     &cancelled,
+                     Arc::clone(&blocks),
+@@ -2556,7 +2517,6 @@
+ async fn handle_nonstreaming(
+     shared: Arc<ServeShared>,
+     body: serde_json::Value,
+-    request_key: Option<String>,
+     encoding: ResponseEncoding,
+     guard: AdmissionGuard,
+     cancelled: Arc<AtomicBool>,
+@@ -2622,7 +2582,6 @@
+                     &shared_clone,
+                     body_for_worker,
+                     guard,
+-                    request_key.as_deref(),
+                     None,
+                     &cancelled,
+                     server_blocks,
+@@ -3006,7 +2965,11 @@
+         resolve_pending_web_searches(
+             &mut body,
+             &serde_json::json!({}),
+-            None,
++            &web_search::SearchSettings::from_values(
++                "",
++                "https://api.deepseek.com/v1/tools/search",
++            )
++            .unwrap(),
+             &blocks,
+             &mut search_uses,
+             &mut search_index,
+diff --git a/crates/hipfire-cli/src/serve/mod.rs b/crates/hipfire-cli/src/serve/mod.rs
+--- a/crates/hipfire-cli/src/serve/mod.rs
++++ b/crates/hipfire-cli/src/serve/mod.rs
+@@ -457,6 +457,7 @@
+     /// (no API key configured) leaves every route open, as before. Never
+     /// logged or serialized: `BearerToken` redacts itself in `Debug`/`Display`.
+     pub(crate) api_key: Option<BearerToken>,
++    pub(crate) web_search: web_search::SearchSettings,
+ }
+ 
+ /// Build the route capability advertisement from the resolved serve
+@@ -1649,6 +1650,7 @@
+     global: hipfire_config::ResolvedConfig,
+     api_key: Option<BearerToken>,
+ ) -> Result<()> {
++    let web_search = web_search::SearchSettings::from_config(&global)?;
+     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+     let registry = load_registry(&paths.registry).registry;
+     let spawner = EngineSpawner {
+@@ -1824,6 +1826,7 @@
+         ui_enabled,
+     );
+     let shared = Arc::new(ServeShared {
++        web_search,
+         capabilities,
+         metrics: metrics::Metrics::default(),
+         runtime: Mutex::new(ServeRuntime {
+diff --git a/crates/hipfire-cli/src/serve/web_search.rs b/crates/hipfire-cli/src/serve/web_search.rs
+--- a/crates/hipfire-cli/src/serve/web_search.rs
++++ b/crates/hipfire-cli/src/serve/web_search.rs
+@@ -9,8 +9,6 @@
+ use std::time::Duration;
+ 
+ pub(crate) const INTERNAL_TOOL_NAME: &str = "__hipfire_deepseek_web_search";
+-pub(crate) const API_KEY_HEADER: &str = "x-hipfire-deepseek-api-key";
+-const SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
+ const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+ const MAX_DOMAINS: usize = 32;
+ 
+@@ -21,45 +19,53 @@
+     pub(crate) model_result: String,
+ }
+ 
+-pub(crate) fn api_key_configured(request_key: Option<&str>) -> bool {
+-    api_key(request_key).is_some()
+-}
+-
+-/// A request-carried DeepSeek credential authenticates the caller's own
+-/// search usage. Require HipFire's bearer authentication only when a key from
+-/// the server process environment would otherwise be used for the caller.
+-pub(crate) fn requires_server_auth(request_key: Option<&str>, server_key_configured: bool) -> bool {
+-    normalize_request_key(request_key).is_none() && server_key_configured
+-}
+-
+-pub(crate) fn normalize_request_key(value: Option<&str>) -> Option<String> {
+-    value
+-        .map(str::trim)
+-        .filter(|value| !value.is_empty())
+-        .map(str::to_owned)
+-}
+-
+-fn api_key(request_key: Option<&str>) -> Option<String> {
+-    let hipfire_key = std::env::var("HIPFIRE_DEEPSEEK_API_KEY").ok();
+-    let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok();
+-    select_api_key(request_key, hipfire_key.as_deref(), deepseek_key.as_deref())
+-}
+-
+-pub(crate) fn server_api_key_configured() -> bool {
+-    api_key(None).is_some()
+-}
+-
+-fn select_api_key(
+-    request_key: Option<&str>,
+-    hipfire_key: Option<&str>,
+-    deepseek_key: Option<&str>,
+-) -> Option<String> {
+-    [request_key, hipfire_key, deepseek_key]
+-        .into_iter()
+-        .flatten()
+-        .map(str::trim)
+-        .find(|value| !value.is_empty())
+-        .map(str::to_owned)
++/// Server-owned settings. Debug redacts the credential via BearerToken.
++#[derive(Debug)]
++pub(crate) struct SearchSettings {
++    api_key: Option<hipfire_config::secret::BearerToken>,
++    url: String,
++}
++
++impl SearchSettings {
++    pub(crate) fn from_config(config: &hipfire_config::ResolvedConfig) -> anyhow::Result<Self> {
++        Self::from_values(
++            &crate::config_string(config, "serve.deepseek_api_key_file")?,
++            &crate::config_string(config, "serve.deepseek_search_url")?,
++        )
++    }
++
++    pub(crate) fn from_values(key_file: &str, url: &str) -> anyhow::Result<Self> {
++        let uri: ureq::http::Uri = url.parse().map_err(|_| {
++            anyhow::anyhow!("serve.deepseek_search_url must be an absolute HTTPS URL")
++        })?;
++        let loopback = matches!(
++            uri.host(),
++            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
++        );
++        if uri.host().is_none()
++            || uri.authority().is_some_and(|a| a.as_str().contains('@'))
++            || !(uri.scheme_str() == Some("https")
++                || (uri.scheme_str() == Some("http") && loopback))
++        {
++            anyhow::bail!("serve.deepseek_search_url requires HTTPS (HTTP is allowed only for loopback tests)");
++        }
++        let api_key = if key_file.is_empty() {
++            None
++        } else {
++            Some(
++                hipfire_config::secret::BearerToken::load(std::path::Path::new(key_file))
++                    .map_err(|error| anyhow::anyhow!("serve.deepseek_api_key_file: {error}"))?,
++            )
++        };
++        Ok(Self {
++            api_key,
++            url: url.to_owned(),
++        })
++    }
++
++    pub(crate) fn is_configured(&self) -> bool {
++        self.api_key.is_some()
++    }
+ }
+ 
+ /// Parse tool arguments, apply Anthropic's domain policy using DeepSeek's
+@@ -68,7 +74,7 @@
+     tool_use_id: &str,
+     input: &Value,
+     config: &Value,
+-    request_key: Option<&str>,
++    settings: &SearchSettings,
+ ) -> SearchOutput {
+     let query = input
+         .get("query")
+@@ -84,7 +90,7 @@
+         "type":"server_tool_use", "id":tool_use_id, "name":name, "input":input
+     });
+ 
+-    let (content, model_result) = match search_content_at(&query, config, request_key, SEARCH_URL) {
++    let (content, model_result) = match search_content_at(&query, config, settings) {
+         Ok((blocks, text)) => (Value::Array(blocks), text),
+         Err(code) => (
+             json!({"type":"web_search_tool_result_error", "error_code":code}),
+@@ -127,8 +133,7 @@
+ fn search_content_at(
+     query: &str,
+     config: &Value,
+-    request_key: Option<&str>,
+-    search_url: &str,
++    settings: &SearchSettings,
+ ) -> Result<(Vec<Value>, String), &'static str> {
+     if query.is_empty() {
+         return Err("invalid_tool_input");
+@@ -154,7 +159,7 @@
+     if query.chars().count() > 128 {
+         return Err("query_too_long");
+     }
+-    let key = api_key(request_key).ok_or("unavailable")?;
++    let key = settings.api_key.as_ref().ok_or("unavailable")?;
+     let agent: ureq::Agent = ureq::Agent::config_builder()
+         .timeout_global(Some(SEARCH_TIMEOUT))
+         .http_status_as_error(false)
+@@ -162,8 +167,8 @@
+         .build()
+         .into();
+     let mut response = agent
+-        .post(search_url)
+-        .header("Authorization", &format!("Bearer {key}"))
++        .post(&settings.url)
++        .header("Authorization", &format!("Bearer {}", key.as_str()))
+         .header("Content-Type", "application/json")
+         .send(json!({"query":query, "count":10, "need_content":false}).to_string())
+         .map_err(|_| "unavailable")?;
+@@ -307,14 +312,74 @@
+ mod tests {
+     use super::*;
+ 
++    fn no_key() -> SearchSettings {
++        SearchSettings::from_values("", "https://api.deepseek.com/v1/tools/search").unwrap()
++    }
++
++    #[test]
++    fn server_settings_validate_endpoint_and_disable_without_key_file() {
++        assert!(!no_key().is_configured());
++        assert!(SearchSettings::from_values("", "http://127.0.0.1:12345/v1/tools/search").is_ok());
++        for url in [
++            "/relative",
++            "http://example.com/search",
++            "ftp://example.com/search",
++            "https://user:password@example.com/search",
++        ] {
++            assert!(SearchSettings::from_values("", url).is_err());
++        }
++    }
++
++    #[test]
++    fn configured_key_file_is_private_and_debug_is_redacted() {
++        use std::io::Write;
++        let path = std::env::temp_dir().join(format!(
++            "hipfire-search-key-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        let mut options = std::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            options.mode(0o600);
++        }
++        let mut file = options.open(&path).unwrap();
++        let secret = "server-config-test-secret-32bytes";
++        writeln!(file, "{secret}").unwrap();
++        let settings = SearchSettings::from_values(
++            path.to_str().unwrap(),
++            "https://api.deepseek.com/v1/tools/search",
++        )
++        .unwrap();
++        assert!(settings.is_configured());
++        assert_eq!(settings.api_key.as_ref().unwrap().as_str(), secret);
++        assert!(!format!("{settings:?}").contains(secret));
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
++            assert!(SearchSettings::from_values(
++                path.to_str().unwrap(),
++                "https://api.deepseek.com/v1/tools/search"
++            )
++            .is_err());
++        }
++        std::fs::remove_file(&path).unwrap();
++    }
++
+     #[test]
+     fn malformed_and_long_queries_fail_closed_without_network_access() {
+         assert_eq!(
+-            search_content_at("", &json!({}), None, SEARCH_URL),
++            search_content_at("", &json!({}), &no_key()),
+             Err("invalid_tool_input")
+         );
+         assert_eq!(
+-            search_content_at(&"x".repeat(129), &json!({}), None, SEARCH_URL),
++            search_content_at(&"x".repeat(129), &json!({}), &no_key()),
+             Err("query_too_long")
+         );
+     }
+@@ -325,8 +390,7 @@
+             search_content_at(
+                 "hipfire",
+                 &json!({"allowed_domains":"github.com"}),
+-                None,
+-                SEARCH_URL
++                &no_key()
+             ),
+             Err("invalid_tool_input")
+         );
+@@ -334,8 +398,7 @@
+             search_content_at(
+                 "hipfire",
+                 &json!({"allowed_domains":["https://github.com"]}),
+-                None,
+-                SEARCH_URL,
++                &no_key(),
+             ),
+             Err("invalid_tool_input")
+         );
+@@ -347,8 +410,7 @@
+             search_content_at(
+                 "hipfire",
+                 &json!({"blocked_domains":["bad domain"]}),
+-                None,
+-                SEARCH_URL,
++                &no_key(),
+             ),
+             Err("invalid_tool_input")
+         );
+@@ -392,42 +454,7 @@
+     }
+ 
+     #[test]
+-    fn request_key_precedes_server_environment_keys() {
+-        assert_eq!(
+-            select_api_key(
+-                Some("  ccswitch-key  "),
+-                Some("hipfire-env-key"),
+-                Some("deepseek-env-key")
+-            ),
+-            Some("ccswitch-key".to_owned())
+-        );
+-        assert_eq!(
+-            select_api_key(None, Some(" hipfire-env-key "), Some("deepseek-env-key")),
+-            Some("hipfire-env-key".to_owned())
+-        );
+-        assert_eq!(
+-            select_api_key(Some("  "), None, Some("fallback")),
+-            Some("fallback".to_owned())
+-        );
+-        assert_eq!(select_api_key(None, None, Some("  ")), None);
+-        assert_eq!(
+-            normalize_request_key(Some("  header-key  ")),
+-            Some("header-key".to_owned())
+-        );
+-        assert_eq!(normalize_request_key(Some(" \t ")), None);
+-        assert_eq!(normalize_request_key(None), None);
+-    }
+-
+-    #[test]
+-    fn request_key_avoids_server_auth_while_server_fallback_requires_it() {
+-        assert!(!requires_server_auth(Some("client-search-key"), true));
+-        assert!(requires_server_auth(Some("   "), true));
+-        assert!(requires_server_auth(None, true));
+-        assert!(!requires_server_auth(None, false));
+-    }
+-
+-    #[test]
+-    fn ccswitch_request_key_authenticates_a_local_search_request() {
++    fn server_config_key_authenticates_a_local_search_request() {
+         use std::io::{Read, Write};
+         use std::net::TcpListener;
+         use std::thread;
+@@ -475,13 +502,15 @@
+         });
+ 
+         let url = format!("http://{address}/v1/tools/search");
+-        let (blocks, text) = search_content_at(
+-            "HipFire local test",
+-            &json!({}),
+-            Some("ccswitch-test-secret"),
+-            &url,
+-        )
+-        .unwrap();
++        let settings = SearchSettings {
++            api_key: Some(
++                hipfire_config::secret::BearerToken::new("server-config-test-secret-32bytes")
++                    .unwrap(),
++            ),
++            url,
++        };
++        let (blocks, text) =
++            search_content_at("HipFire local test", &json!({}), &settings).unwrap();
+         assert_eq!(blocks[0]["title"], "Local test");
+         assert!(text.contains("Mock result"));
+ 
+@@ -493,8 +522,8 @@
+                     .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+             })
+             .unwrap();
+-        assert!(authorization.ends_with("Bearer ccswitch-test-secret"));
++        assert!(authorization.ends_with("Bearer server-config-test-secret-32bytes"));
+         let body = request.split_once("\r\n\r\n").unwrap().1;
+-        assert!(!body.contains("ccswitch-test-secret"));
+-    }
+-}
++        assert!(!body.contains("server-config-test-secret-32bytes"));
++    }
++}
+diff --git a/crates/hipfire-config/src/lib.rs b/crates/hipfire-config/src/lib.rs
+--- a/crates/hipfire-config/src/lib.rs
++++ b/crates/hipfire-config/src/lib.rs
+@@ -1465,6 +1465,30 @@
+         false,
+         Some("HIPFIRE_SERVE_API_KEY_FILE"),
+         "Absolute path of a file holding the serve bearer token (at least 32 bytes after trimming trailing whitespace; Unix mode must grant no group/other access). Empty (unset) keeps serve keyless; the token itself is never stored in configuration."
++    ),
++    field!(
++        "serve.deepseek_api_key_file",
++        "deepseek_api_key_file",
++        Serve,
++        Process,
++        DefaultValue::String(""),
++        ValueRule::AbsolutePathOrEmpty,
++        false,
++        false,
++        None,
++        "Absolute path of the DeepSeek Search API key file (Unix mode 600; at least 32 printable ASCII bytes). Empty disables native web search. The key is server-owned; client headers and environment keys are not used. Restart serve after changing this setting."
++    ),
++    field!(
++        "serve.deepseek_search_url",
++        "deepseek_search_url",
++        Serve,
++        Process,
++        DefaultValue::String("https://api.deepseek.com/v1/tools/search"),
++        ValueRule::String,
++        false,
++        false,
++        None,
++        "DeepSeek-compatible Search API endpoint. HTTPS is required except for loopback test endpoints. Redirects are disabled. Restart serve after changing this setting."
+     ),
+     // --- Serving cache/scheduler contract keys (spec §9.1) -----------------
+     // All experimental: the cache/scheduler route is planned and has not
+diff --git a/docs/SERVE.md b/docs/SERVE.md
+--- a/docs/SERVE.md
++++ b/docs/SERVE.md
+@@ -566,12 +566,27 @@
+ DeepSeek `site:` filters. Queries are limited to DeepSeek's 128-character
+ limit; `max_uses` is capped at 64 per request (default 8).
+ 
+-Set `HIPFIRE_DEEPSEEK_API_KEY` in the HipFire server process environment
+-(`DEEPSEEK_API_KEY` is accepted as a fallback). Because this enables paid
+-search using a server-held credential, the HipFire listener must also have
+-`serve.api_key_file` configured; requests without a valid bearer are already
+-rejected before the request body is read. The direct Search API is billed per
+-successful result; see [DeepSeek Search & Fetch billing](https://api-docs.deepseek.com/guides/search/#billing).
++Configure the server-owned key with HipFire's typed config commands:
++
++```bash
++hipfire config set serve.deepseek_api_key_file /absolute/path/to/deepseek-api-key
++hipfire config set serve.deepseek_search_url https://api.deepseek.com/v1/tools/search
++hipfire config explain serve.deepseek_api_key_file
++```
++
++The credential file follows the existing `serve.api_key_file` rules: at least
++32 printable ASCII bytes, with Unix permissions granting no group/other access
++(`chmod 600`). Configuration and diagnostics contain its path, never its value.
++The service loads it at startup; restart serve after changing either the path,
++file contents, or endpoint. An empty path disables native web search.
++
++Client `X-HipFire-DeepSeek-API-Key` headers and the old `HIPFIRE_DEEPSEEK_API_KEY`
++/ `DEEPSEEK_API_KEY` environment variables are ignored. Ordinary server bearer
++authentication remains optional and follows the existing `serve.api_key_file`
++setting. All callers allowed to use this server share its search credential and
++quota. The endpoint must use HTTPS, except loopback mock servers; redirects are
++disabled. Search uses the provider's billed API; see
++[DeepSeek Search & Fetch billing](https://api-docs.deepseek.com/guides/search/#billing).
+ 
+ Dynamic filtering that calls web search from `code_execution` is refused unless
+ the tool explicitly permits direct calls. The Search API accepts an IP address

@@ -10,7 +10,7 @@ The patch includes the previously requested Claude Code compatibility work and D
 - Raises the total tool documentation budget to 4 MiB while retaining separate tool/name/schema limits.
 - Executes Claude’s native `web_search` server tool through DeepSeek’s Search API, maps results to Anthropic server-tool response blocks, and feeds summaries back into local generation.
 - Preserves the mixed server/client tool sequence: a search is deferred when Claude Code also needs to run a local tool, then executed after the client returns its result.
-- Uses the DeepSeek key carried by each Claude Code request; a server-side DeepSeek key remains an optional fallback and requires HipFire bearer authentication. Search result text is explicitly marked as untrusted input to reduce prompt-injection risk.
+- Loads the DeepSeek Search credential from the server-owned file configured by `hipfire config`; client headers and legacy environment credentials are ignored.
 
 ## Apply after a HipFire upgrade
 
@@ -26,7 +26,7 @@ If you specifically want to patch your older standalone clone instead, pass its 
 ./scripts/apply.sh /path/to/your/hipfire-clone
 ```
 
-The script applies the original compatibility patch followed by the deferred-tool patch. It also upgrades a source tree that already has the original patch, detects an already-completed upgrade, and refuses unrelated dirty source trees. Each patch is checked before application; if a fresh installation cannot apply the second patch, the first patch is rolled back. If the patch no longer applies cleanly after a later upstream change, stop and rebase/review it; do not force-apply it.
+The script applies the original compatibility patch, the deferred-tool patch, and the server-search-config patch in order. It also upgrades a source tree that already has the original patch or the deferred-tool update, detects an already-completed upgrade, and refuses unrelated dirty source trees. Each patch is checked before application; if any patch fails, only patches newly applied by that invocation are rolled back. If the patch no longer applies cleanly after a later upstream change, stop and rebase/review it; do not force-apply it.
 
 Build the changed binaries from that source tree:
 
@@ -46,7 +46,7 @@ install -m 755 "$HOME/.hipfire/src/target/release/hipfire" "$HOME/.hipfire/bin/h
 install -m 755 "$HOME/.hipfire/src/target/release/daemon" "$HOME/.hipfire/bin/daemon"
 ```
 
-Start HipFire again using your normal service command. The backup directory contains the previous binaries for rollback. To remove the patch before applying another version, stop HipFire and run:
+Start HipFire again using your normal service command. The backup directory contains the previous binaries for rollback. If rolling back to a binary without this configuration patch, first reset `serve.deepseek_api_key_file` and `serve.deepseek_search_url` with the patched CLI so the older schema does not encounter unknown keys. To remove the patch before applying another version, stop HipFire and run:
 
 ```bash
 ./scripts/revert.sh "$HOME/.hipfire/src"
@@ -54,36 +54,36 @@ Start HipFire again using your normal service command. The backup directory cont
 
 ## DeepSeek Search API setup
 
-The patched HipFire server accepts the DeepSeek key either in a Claude Code request header or from its own process environment. When both are present, the request header takes precedence. The header name is `X-HipFire-DeepSeek-API-Key`.
+DeepSeek Search is configured on the HipFire server through the same typed `hipfire config` interface as other settings. It uses a private key file, following HipFire's existing `serve.api_key_file` convention. CC Switch only configures the model connection; it no longer carries a Search API key.
 
-### Configure both keys through CC Switch
-
-In the Claude Code provider editor, set the protocol to Anthropic Messages and the base URL to `http://127.0.0.1:11435`. If you have configured HipFire bearer authentication, enter its matching token in the provider's **API Key** field. CC Switch maps that value to Claude Code's `ANTHROPIC_AUTH_TOKEN`.
-
-Then add the DeepSeek Search key in the Claude Code config JSON editor at the bottom of the provider editor. Preserve the existing JSON and add this property inside its `env` object:
-
-```json
-"ANTHROPIC_CUSTOM_HEADERS": "X-HipFire-DeepSeek-API-Key: <DEEPSEEK_SEARCH_API_KEY>"
-```
-
-Replace the placeholder with your DeepSeek API key. Claude Code requires version 2.1.227 or newer for `ANTHROPIC_CUSTOM_HEADERS`; this host has 2.1.310. CC Switch v4.0.19 writes custom environment variables from this editor to the global `~/.claude/settings.json`, so the DeepSeek header is sent to whichever Claude Code provider is selected. Remove it from the editor before switching to another provider. The value is stored in that JSON file; treat the file as a secret. Keep the HipFire base URL on `127.0.0.1` when CC Switch and HipFire run on the same machine, because plain HTTP over a LAN would expose the header in transit. See the [Claude Code environment-variable reference](https://code.claude.com/docs/en/env-vars) and [CC Switch provider editor guide](https://github.com/farion1231/cc-switch/blob/v4.0.19/docs/user-manual/en/2-providers/2.3-edit.md).
-
-### Configure the key in the HipFire service instead
-
-If you do not want Claude Code to send the DeepSeek key, set one of these variables in the HipFire process environment:
-
-- `HIPFIRE_DEEPSEEK_API_KEY` (preferred)
-- `DEEPSEEK_API_KEY` (fallback)
-
-For a foreground launch, enter the key without echoing it and then start the service in that same shell:
+After building/installing the patch, run this helper and enter the key at its hidden prompt:
 
 ```bash
-read -r -s -p 'DeepSeek API key: ' HIPFIRE_DEEPSEEK_API_KEY
-printf '\n'
-export HIPFIRE_DEEPSEEK_API_KEY
+./scripts/configure-search.sh
 ```
 
-For systemd, store it in a permission-restricted environment file and reference that file from the HipFire service unit; do not put the key in this patch kit or a shell command line. With the CC Switch request-header method above, HipFire does not need a server-side DeepSeek key or a `serve.api_key_file` just to perform search: each request carries the caller's DeepSeek credential. If you instead configure the DeepSeek key in HipFire's process environment, enable HipFire bearer authentication so LAN clients cannot spend that server-held key. Independently, bearer authentication is recommended when exposing the inference API to a LAN. Search and Fetch are listed at $0.75 per 1,000 successful direct API requests in [DeepSeek’s Search & Fetch billing docs](https://api-docs.deepseek.com/guides/search/#billing); this patch calls the Search endpoint directly.
+The helper creates `~/.hipfire/secrets/deepseek-api-key` with mode 600 and runs:
+
+```bash
+hipfire config set serve.deepseek_api_key_file "$HOME/.hipfire/secrets/deepseek-api-key"
+hipfire config set serve.deepseek_search_url https://api.deepseek.com/v1/tools/search
+```
+
+You can also create your own private key file and pass its absolute path to `hipfire config set`. The key must contain at least 32 printable ASCII bytes, with no spaces; a final newline is allowed. The helper accepts an optional absolute key-file path and optional endpoint URL as its first and second arguments.
+
+Inspect or clear the configuration using the native commands:
+
+```bash
+hipfire config get serve.deepseek_api_key_file
+hipfire config explain serve.deepseek_search_url
+hipfire config reset serve.deepseek_api_key_file
+```
+
+Restart HipFire after changing either setting or the key-file contents. The service snapshots these settings at startup. A blank/unset key-file setting disables native search. Missing, invalid, or loosely permissioned key files prevent startup with a diagnostic that does not expose the key. The endpoint requires HTTPS except for loopback mock servers; redirects are disabled. Keys never appear in `config get/list/explain` output because those commands store and show only the filename.
+
+The legacy `X-HipFire-DeepSeek-API-Key` request header and the `HIPFIRE_DEEPSEEK_API_KEY` / `DEEPSEEK_API_KEY` environment variables are ignored. Remove only the obsolete Search header from `ANTHROPIC_CUSTOM_HEADERS` in both active Claude Code settings and saved CC Switch provider/common configuration; retain unrelated custom headers. Changing the server configuration does not require adding a header to any client.
+
+HipFire's listener authentication is independently configured by `serve.api_key_file`. It remains optional; all callers admitted to this server share its Search key and quota. This patch does not require a second client token solely for search. DeepSeek Search is billed by the external provider; the regression tests use a local mock and do not call the billed endpoint.
 
 The adapter supports the basic `web_search_20250305` tool and direct-call use of the 20260209/20260318 variants. It refuses dynamic-filtering requests that require code execution, and it does not implement Claude’s separate `web_fetch` tool. Anthropic’s protocol requires a `server_tool_use` / `web_search_tool_result` pair; when mixed with client tools, the result is deferred until the client tool result arrives ([server tool protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/server-tools), [web search protocol](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool)). DeepSeek’s API accepts `query`, `count`, `need_content`, domain operators, and returns ranked results with summary, snippet, URL, and date ([Search API](https://api-docs.deepseek.com/guides/search/)).
 
@@ -129,7 +129,7 @@ export HIPFIRE_MODEL=/absolute/path/to/qwen3.8-flash-next.mq4-xts
 ./scripts/start-serve-1m.sh
 ```
 
-The service binds to `0.0.0.0:11435` by default; set `BIND_ADDRESS=127.0.0.1` for localhost only. The profile uses YaRN factor 4, Q8 KV, MTP, and the existing GPU/NPU trunk route. With the CC Switch request-header key, no extra HipFire bearer-key setup is required for search; bearer authentication remains recommended for general LAN API access.
+The service binds to `0.0.0.0:11435` by default; set `BIND_ADDRESS=127.0.0.1` for localhost only. The profile uses YaRN factor 4, Q8 KV, MTP, and the existing GPU/NPU trunk route. Search credentials are loaded from the server-owned key file configured above.
 
 CC Switch provider settings for Claude Code:
 
@@ -138,13 +138,19 @@ CC Switch provider settings for Claude Code:
 | API compatibility | Anthropic Messages API |
 | Base URL (same host) | `http://127.0.0.1:11435` |
 | Base URL (other LAN device) | Use a TLS-protected endpoint; plain HTTP exposes the custom DeepSeek header |
-| API key | If HipFire bearer authentication is configured, use the matching token; the request-header search mode needs no extra server token |
+| API key | If HipFire bearer authentication is configured, use the matching token; Search uses the server-owned key file and needs no custom client header |
 | Model and model aliases | The exact model ID/path accepted by the HipFire server |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `1048576` |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | `786432` |
 | Thinking | Keep enabled; do not set a thinking-disable variable |
 
 These values are guidance for CC Switch; this package does not edit the client’s personal provider settings. Verify that TCP port 11435 is reachable from the intended host. When bearer authentication is enabled, the provider API key must match the server token.
+
+## Server-owned search configuration verification (2026-10-25)
+
+The server-search-config update passed 260 serving/adapter tests and 357 configuration tests. Coverage includes local mock Search HTTP authorization, endpoint validation, private key-file loading, secret redaction, native config set/get/reset via the hidden-prompt helper, and patch upgrades/reverts from each older patch state.
+
+The updated service was restarted with the configured private key file. A Messages request declaring the native Search tool succeeded with HTTP 200 without a custom Search header. That diagnostic explicitly set `tool_choice: none`, so it did not execute a billed search; the outbound Search request itself is covered by the local mock test. The deferred-tool count/generation regression also remained passing. See `verification/server-search-config.json` for sanitized results.
 
 ## Deferred-tool verification results
 
@@ -168,10 +174,10 @@ Sanitized reports (no user prompts, keys, or tool documentation) are in `verific
 The patch was tested in a temporary worktree based on the commit above:
 
 - Anthropic adapter tests after the deferred-tool fix: 22 passed, including deferred-schema filtering, reference validation, count/generation projection parity, and the existing native-search/client-tool round trip.
-- DeepSeek web-search tests: passed, including key precedence, a local mock Search API request, result-to-Anthropic mapping, and continuation decoding.
+- DeepSeek web-search tests: passed, including server key-file validation/redaction, a local mock Search API request, result-to-Anthropic mapping, and continuation decoding.
 - HipFire CLI tests: 877 passed, 0 failed, 1 ignored. HipFire daemon tests: 62 passed, 0 failed.
 - Pending search/server result ordering test: passed without a network call.
 - Qwen4 inline-system adapter tests in generate and loader crates: passed.
 - Earlier checks on the same patch set also passed the tool-budget regression and `cargo check` for `hipfire-cli` and `hipfire-generate`.
 
-No live DeepSeek API call was made because it is billable and no credential was supplied. The local mock test verifies the request's bearer header and response mapping without contacting DeepSeek.
+No live DeepSeek API call is needed for the regression suite because it uses a local mock. The local mock test verifies the request's bearer header and response mapping without contacting DeepSeek.
